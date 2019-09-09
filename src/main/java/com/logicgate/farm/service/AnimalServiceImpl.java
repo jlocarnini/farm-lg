@@ -13,6 +13,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 @Service
@@ -21,6 +24,9 @@ public class AnimalServiceImpl implements AnimalService {
 
   @Autowired
   private ApplicationContext applicationContext;
+
+  // stores locks by color to avoid excessive waiting
+  private ConcurrentHashMap<Color, Lock> colorLock = new ConcurrentHashMap<>();
 
   private Random random = new Random();
 
@@ -91,20 +97,30 @@ public class AnimalServiceImpl implements AnimalService {
     // retrieve new BarnOrganizer from context
     BarnOrganizer barnOrganizer = applicationContext.getBean(BarnOrganizer.class);
 
-    // get all animals with the same color / barn
-    List<Animal> animalsMatchingColor = animalRepository.findAnimalsByFavoriteColor(animal.getFavoriteColor());
-    // organize animals by barn ID
-    Map<Barn, List<Animal>> barnedAnimals = animalsMatchingColor.stream().collect(Collectors.groupingBy(Animal::getBarn));
-    // find a barn with availability
-    Barn availableBarn = findOrCreateBarnWithAvailability(barnedAnimals, animal.getFavoriteColor());
-    // add new animal to the barn
-    barnedAnimals.getOrDefault(availableBarn, new ArrayList<>()).add(animal);
-    animal.setBarn(availableBarn);
-    animalRepository.save(animal);
-    // organize / rebalance the barns for this color, since we've modified it
-    List<Animal> updatedAnimals = barnOrganizer.organizeAnimals(barnedAnimals);
-    // update any animals that were modified during the reorganization
-    animalRepository.saveAll(updatedAnimals);
+    // retrieve lock for animals color to prevent updates to related barns
+    Lock lock = colorLock.computeIfAbsent(animal.getFavoriteColor(), l -> new ReentrantLock());
+    lock.lock();
+
+    try {
+      // get all animals with the same color / barn
+      List<Animal> animalsMatchingColor = animalRepository.findAnimalsByFavoriteColor(animal.getFavoriteColor());
+      // organize animals by barn ID
+      Map<Barn, List<Animal>> barnedAnimals = animalsMatchingColor.stream().collect(Collectors.groupingBy(Animal::getBarn));
+      // find a barn with availability
+      Barn availableBarn = findOrCreateBarnWithAvailability(barnedAnimals, animal.getFavoriteColor());
+      // add new animal to the barn
+      barnedAnimals.getOrDefault(availableBarn, new ArrayList<>()).add(animal);
+      animal.setBarn(availableBarn);
+      animalRepository.save(animal);
+      // organize / rebalance the barns for this color, since we've modified it
+      List<Animal> updatedAnimals = barnOrganizer.organizeAnimals(barnedAnimals);
+      // update any animals that were modified during the reorganization
+      animalRepository.saveAll(updatedAnimals);
+    }
+    finally {
+      // ensure we release the lock
+      lock.unlock();
+    }
 
     return animal;
 
@@ -120,27 +136,37 @@ public class AnimalServiceImpl implements AnimalService {
     Map<Color, List<Animal>> animalsByColor = animals.stream().collect(Collectors.groupingBy(Animal::getFavoriteColor));
 
     for (Map.Entry<Color, List<Animal>> colorSet : animalsByColor.entrySet()) {
-      // get all animals with the same color
-      List<Animal> animalsMatchingColor = animalRepository.findAnimalsByFavoriteColor(colorSet.getKey());
-      // store the barns in a set for later reuse
-      Set<Barn> existingBarns = animalsMatchingColor.stream().map(Animal::getBarn).collect(Collectors.toSet());
-      // add the new animals to the existing list
-      animalsMatchingColor.addAll(colorSet.getValue());
-      // organize the animals so that they're ready to be added to barns and persisted
-      List<List<Animal>> organizedAnimals = barnOrganizer.initializeAnimals(animalsMatchingColor);
+      // retrieve lock for current color to prevent updates to related barns
+      Lock lock = colorLock.computeIfAbsent(colorSet.getKey(), l -> new ReentrantLock());
+      lock.lock();
 
-      Iterator<Barn> barnIterator = existingBarns.iterator();
-      for (List<Animal> barnOfAnimals : organizedAnimals) {
-        // get existing or create new barn
-        Barn addToBarn = barnIterator.hasNext() ? barnIterator.next() : createNewBarn(colorSet.getKey());
-        // add animals to the barn
-        barnOfAnimals.forEach(animal -> animal.setBarn(addToBarn));
-        // persist the animals
-        animalRepository.saveAll(barnOfAnimals);
+      try {
+        // get all animals with the same color
+        List<Animal> animalsMatchingColor = animalRepository.findAnimalsByFavoriteColor(colorSet.getKey());
+        // store the barns in a set for later reuse
+        Set<Barn> existingBarns = animalsMatchingColor.stream().map(Animal::getBarn).collect(Collectors.toSet());
+        // add the new animals to the existing list
+        animalsMatchingColor.addAll(colorSet.getValue());
+        // organize the animals so that they're ready to be added to barns and persisted
+        List<List<Animal>> organizedAnimals = barnOrganizer.initializeAnimals(animalsMatchingColor);
+
+        Iterator<Barn> barnIterator = existingBarns.iterator();
+        for (List<Animal> barnOfAnimals : organizedAnimals) {
+          // get existing or create new barn
+          Barn addToBarn = barnIterator.hasNext() ? barnIterator.next() : createNewBarn(colorSet.getKey());
+          // add animals to the barn
+          barnOfAnimals.forEach(animal -> animal.setBarn(addToBarn));
+          // persist the animals
+          animalRepository.saveAll(barnOfAnimals);
+        }
+        // delete any remaining barns
+        while (barnIterator.hasNext()) {
+          barnRepository.delete(barnIterator.next());
+        }
       }
-      // delete any remaining barns
-      while (barnIterator.hasNext()) {
-        barnRepository.delete(barnIterator.next());
+      finally {
+        // ensure we release the lock
+        lock.unlock();
       }
 
     }
@@ -152,18 +178,28 @@ public class AnimalServiceImpl implements AnimalService {
     // retrieve new BarnOrganizer from context
     BarnOrganizer barnOrganizer = applicationContext.getBean(BarnOrganizer.class);
 
-    // remove animal from repository
-    animalRepository.delete(animal);
-    // get all animals with the same color / barn
-    List<Animal> animalsMatchingColor = animalRepository.findAnimalsByFavoriteColor(animal.getFavoriteColor());
-    // organize animals by barn ID
-    Map<Barn, List<Animal>> barnedAnimals = animalsMatchingColor.stream().collect(Collectors.groupingBy(Animal::getBarn));
-    // organize / rebalance the barns for this color, since we've modified it
-    List<Animal> updatedAnimals = barnOrganizer.organizeAnimals(barnedAnimals);
-    // update any animals that were modified during the reorganization
-    animalRepository.saveAll(updatedAnimals);
-    // delete any empty barns
-    cleanupEmptyBarns(barnedAnimals);
+    // retrieve lock for animals color to prevent updates to related barns
+    Lock lock = colorLock.computeIfAbsent(animal.getFavoriteColor(), l -> new ReentrantLock());
+    lock.lock();
+
+    try {
+      // remove animal from repository
+      animalRepository.delete(animal);
+      // get all animals with the same color / barn
+      List<Animal> animalsMatchingColor = animalRepository.findAnimalsByFavoriteColor(animal.getFavoriteColor());
+      // organize animals by barn ID
+      Map<Barn, List<Animal>> barnedAnimals = animalsMatchingColor.stream().collect(Collectors.groupingBy(Animal::getBarn));
+      // organize / rebalance the barns for this color, since we've modified it
+      List<Animal> updatedAnimals = barnOrganizer.organizeAnimals(barnedAnimals);
+      // update any animals that were modified during the reorganization
+      animalRepository.saveAll(updatedAnimals);
+      // delete any empty barns
+      cleanupEmptyBarns(barnedAnimals);
+    }
+    finally {
+      // ensure we release the lock
+      lock.unlock();
+    }
 
   }
 
